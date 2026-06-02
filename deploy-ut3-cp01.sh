@@ -26,7 +26,7 @@
 # receives App Store apps later from the EmberNet dashboard.
 #
 # Workloads on CP-01:
-#   - embernetlite (Quadlet, ghcr.io/embernet-ai/embernetlite:0.0.29)
+#   - embernetlite (Quadlet, ghcr.io/embernet-ai/embernetlite:0.0.33)
 #       This IS the VPN: ships its own WireGuard driver and brings up
 #       `embernet0` post-enrollment. The operator must complete enrollment
 #       via AAD device-code (browser) after Phase 1 finishes. Re-run the
@@ -90,7 +90,7 @@ CODESYS_IMAGE="localhost/embernet/codesys-sl:4.20.0.0"
 # (Pull= rename, EnvironmentFile= removal). Do NOT roll back to
 # :stable or :latest until 0.0.30+ ships with non-interactive
 # enrollment.
-EMBERNET_IMAGE="ghcr.io/embernet-ai/embernetlite:0.0.29"
+EMBERNET_IMAGE="ghcr.io/embernet-ai/embernetlite:0.0.33"
 
 # K3s — host install, cluster-init (HA seed)
 K3S_VERSION="v1.34.5+k3s1"
@@ -171,24 +171,22 @@ preflight_checks() {
   # (No legacy `vpn.embernet.ai` /etc/hosts pin: embernetlite is the VPN
   # now and manages its own dial-home — see install_embernetlite below.)
 
-  # --- Backup resolv.conf ---
-  cp /etc/resolv.conf /etc/resolv.conf.embernet-backup 2>/dev/null || true
-
-  # --- DNS validation (gotchas table: empty/symlinked resolv.conf) ---
+  # --- DNS validation (READ ONLY) ---
+  # We DO NOT touch /etc/resolv.conf anymore. On corporate / AD-joined
+  # boxes the original behaviour (clobber with 8.8.8.8 + 1.1.1.1 if
+  # github.com didn't resolve) destroyed internal DNS for TeamViewer,
+  # Active Directory, internal apt mirrors — wholesale breakage for a
+  # symptom that's the operator's to diagnose. If DNS is broken now,
+  # we fail loud with the operator command to fix it. We do not guess.
   log "Verifying host DNS resolves before network-dependent steps"
   if ! getent hosts github.com >/dev/null 2>&1; then
-    warn "Host DNS broken — github.com unresolvable. Resetting /etc/resolv.conf."
-    if [[ -e /etc/resolv.conf && ! -L /etc/resolv.conf ]]; then
-      rm -f /etc/resolv.conf
-    fi
-    printf 'nameserver 8.8.8.8\nnameserver 1.1.1.1\n' > /etc/resolv.conf
-    if ! getent hosts github.com >/dev/null 2>&1; then
-      fail "Host DNS still broken after reset. Manually fix: echo 'nameserver 8.8.8.8' > /etc/resolv.conf"
-    fi
-    log "DNS recovered — github.com now resolves"
-  else
-    log "DNS OK"
+    fail "Host DNS cannot resolve github.com — fix DNS before running this script. \
+We will NOT overwrite /etc/resolv.conf. \
+If systemd-resolved is the resolver, check: resolvectl status. \
+If a static file, check: cat /etc/resolv.conf. \
+Acceptable nameservers per your network policy go in resolv.conf or systemd-resolved config."
   fi
+  log "DNS OK"
 
   # --- Sysctl: forward + inotify + file-max ---
   # Gotchas table: containerd/CRI on a multi-container host exhausts
@@ -704,10 +702,39 @@ install_embernetlite() {
     apt-get purge -y openziti 2>/dev/null || true
   fi
 
-  # Idempotency gate.
-  if container_already_running systemd-embernet; then
-    log "[7/11] embernetlite already running — skipping"
-    return 0
+  # Image-version-aware idempotency gate. Re-runnable — the script can
+  # be invoked any number of times and will pick up image-pin bumps
+  # automatically:
+  #
+  #   - Container exists + running + same image as ${EMBERNET_IMAGE}
+  #     → skip, nothing to do.
+  #   - Container exists + running + DIFFERENT image
+  #     → recreate (operator bumped the pin; this is the resume path).
+  #   - Container exists + not running (Exited / Created / Paused)
+  #     → recreate (cleans up stale state from prior crashloop / oom).
+  #   - Container does not exist
+  #     → fresh create.
+  #
+  # IMPORTANT: this is what makes re-running the deploy script after an
+  # embernetlite version bump (e.g. 0.0.29 → 0.0.33 to pick up a netlink
+  # panic fix) work without manual `podman rm`. The plain
+  # container_already_running helper does NOT image-check.
+  local need_recreate=1
+  if podman container exists systemd-embernet 2>/dev/null; then
+    local em_state em_image
+    em_state=$(podman inspect systemd-embernet --format '{{.State.Status}}' 2>/dev/null || echo "unknown")
+    em_image=$(podman inspect systemd-embernet --format '{{.ImageName}}' 2>/dev/null || echo "")
+    if [[ "${em_state}" == "running" && "${em_image}" == "${EMBERNET_IMAGE}" ]]; then
+      log "[7/11] embernetlite already running on ${EMBERNET_IMAGE} — skipping"
+      return 0
+    fi
+    if [[ "${em_state}" == "running" ]]; then
+      log "embernetlite container running on ${em_image} but pin is ${EMBERNET_IMAGE} — recreating to pick up the new image"
+    else
+      log "embernetlite container exists but is ${em_state} (likely prior crashloop) — recreating"
+    fi
+    podman rm -f systemd-embernet >/dev/null 2>&1 || true
+    need_recreate=1
   fi
 
   # Pull the image up front so the first `podman run` is local-only.
