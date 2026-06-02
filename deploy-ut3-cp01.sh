@@ -26,7 +26,7 @@
 # receives App Store apps later from the EmberNet dashboard.
 #
 # Workloads on CP-01:
-#   - embernetlite (Quadlet, ghcr.io/embernet-ai/embernetlite:0.0.33)
+#   - embernetlite (Quadlet, ghcr.io/embernet-ai/embernetlite:0.0.34)
 #       This IS the VPN: ships its own WireGuard driver and brings up
 #       `embernet0` post-enrollment. The operator must complete enrollment
 #       via AAD device-code (browser) after Phase 1 finishes. Re-run the
@@ -90,7 +90,7 @@ CODESYS_IMAGE="localhost/embernet/codesys-sl:4.20.0.0"
 # (Pull= rename, EnvironmentFile= removal). Do NOT roll back to
 # :stable or :latest until 0.0.30+ ships with non-interactive
 # enrollment.
-EMBERNET_IMAGE="ghcr.io/embernet-ai/embernetlite:0.0.33"
+EMBERNET_IMAGE="ghcr.io/embernet-ai/embernetlite:0.0.34"
 
 # K3s — host install, cluster-init (HA seed)
 K3S_VERSION="v1.34.5+k3s1"
