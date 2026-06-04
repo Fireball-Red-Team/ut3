@@ -516,6 +516,15 @@ DOCKERFILE
     rm -rf "${BUILD_DIR}"
   fi
 
+  # Defensive cleanup: remove any pre-existing `codesys` container (stopped,
+  # created, or otherwise NOT-running so container_already_running returned
+  # false above). Without this, `podman run --name codesys` collides on the
+  # stale name and the deploy halts. Idempotent — silent if absent.
+  if podman container exists codesys 2>/dev/null; then
+    log "Removing pre-existing (non-running) codesys container before fresh start"
+    podman rm -f codesys >/dev/null 2>&1 || true
+  fi
+
   podman run -d \
     --name codesys \
     --restart=always \
