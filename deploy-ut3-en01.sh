@@ -545,6 +545,90 @@ DOCKERFILE
   log "[4/8] Codesys: $(podman ps --filter name=codesys --format '{{.Status}}' 2>/dev/null || echo 'starting')"
 }
 
+# ─── self-heal: detect stale embernet enrollment + wipe ──────
+# On a RE-RUN of this script (operator bumps NODE_NAME, hub rotates the
+# stale peer entry, a prior enrollment never fully registered, etc.),
+# the daemon may come up against persisted state from /var/lib/embernet
+# but the kernel WireGuard handshake against the hub never completes —
+# the public key on disk is no longer in the hub's peer table.
+#
+# Live signature seen on ark-3533 during EN-0001 install 2026-06-04:
+#   sudo wg show embernet0
+#   peer: <hub-pubkey>
+#     transfer: 0 B received, 9.25 KiB sent      <- outbound only, hub silent
+#     (NO "latest handshake:" line at all)
+#
+# This function probes that exact state and, when it sees it, wipes the
+# stale state files + removes the container so install_embernetlite
+# re-creates a fresh daemon that runs through AAD device-code enrollment
+# from scratch — minting a fresh keypair the provisioner registers
+# cleanly with the hub.
+#
+# Idempotent: on a TRULY fresh box (no embernet0, no container, no
+# auth.token), this is a no-op. Only fires when the symptom matches.
+heal_stale_embernet_enrollment() {
+  # No prior enrollment state → nothing to heal
+  if [[ ! -f /var/lib/embernet/auth.token ]] && [[ ! -f /var/lib/embernet/endpoint.id ]]; then
+    return 0
+  fi
+  # No embernet0 interface → daemon hasn't tried to come up yet, let
+  # install_embernetlite handle the cold start
+  if ! ip link show embernet0 >/dev/null 2>&1; then
+    return 0
+  fi
+  # No container → already torn down; install_embernetlite will rebuild
+  if ! podman container exists systemd-embernet 2>/dev/null; then
+    return 0
+  fi
+
+  log "Probing existing embernet0 for stale-enrollment signature..."
+
+  # Settle window: a freshly started daemon may need ~10-20 s for the
+  # first handshake to complete on a healthy registration. Give it 30 s.
+  local attempt=0
+  local healthy=0
+  local rx_bytes
+  while [[ ${attempt} -lt 6 ]]; do
+    # `wg show embernet0 transfer` prints: <peer-pubkey> <rx> <tx>
+    rx_bytes=$(wg show embernet0 transfer 2>/dev/null | awk 'NR==1 {print $2}')
+    if [[ -n "${rx_bytes}" && "${rx_bytes}" != "0" ]]; then
+      healthy=1
+      break
+    fi
+    sleep 5
+    attempt=$((attempt + 1))
+  done
+
+  if [[ ${healthy} -eq 1 ]]; then
+    log "embernet0 WG handshake healthy (rx=${rx_bytes} B) — keeping enrollment"
+    return 0
+  fi
+
+  warn "embernet0 up but WG handshake has NEVER completed after 30 s (rx=0). \
+Stale enrollment detected — wiping daemon state to force fresh AAD device-code re-enroll."
+  warn "  Preserved: /etc/embernet/k3s-token (K3s join token survives)"
+
+  # Stop + remove the container so install_embernetlite below recreates it
+  systemctl stop embernet 2>/dev/null || true
+  podman stop -t 5 systemd-embernet >/dev/null 2>&1 || true
+  podman rm -f systemd-embernet >/dev/null 2>&1 || true
+
+  # Wipe enrollment state. Preserve /etc/embernet/k3s-token (cluster
+  # join token; lives in /etc not /var/lib).
+  rm -f /var/lib/embernet/auth.token \
+        /var/lib/embernet/device.token \
+        /var/lib/embernet/refresh.token \
+        /var/lib/embernet/endpoint.id \
+        /var/lib/embernet/pretunnel-state.json
+  rm -rf /var/lib/embernet/identity /var/lib/embernet/wireguard
+
+  # Bring down the (now-orphan) embernet0 interface so install_embernetlite
+  # + the daemon recreate it fresh
+  ip link delete embernet0 2>/dev/null || true
+
+  log "Stale state cleared. install_embernetlite will recreate the daemon and gate_on_embernet0 will drive fresh AAD device-code enrollment."
+}
+
 # ─── [5/8] embernetlite (EmbernetEndpoint-Linux, Quadlet) ────
 # embernetlite IS the VPN at v0.0.29 — it ships its own WireGuard driver
 # and brings up `embernet0` in the host netns post-enrollment. K3s agent
@@ -1386,6 +1470,10 @@ preflight_checks
 configure_firewall
 configure_crash_reboot
 install_codesys
+# Self-heal a stale embernet enrollment from a prior run (rx=0 / no
+# handshake against the hub) BEFORE install_embernetlite so the
+# fresh-container path takes over. No-op on a truly fresh box.
+heal_stale_embernet_enrollment
 install_embernetlite
 
 # Phase 1 → Phase 2 gate — exit 0 here if operator hasn't completed
