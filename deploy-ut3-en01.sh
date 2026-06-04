@@ -247,7 +247,11 @@ Check: modinfo wireguard. If absent, embernetlite will fall back to wireguard-go
 
   # --- Install base packages ---
   apt-get update
-  apt-get install -y curl wget openssl podman dnsutils jq iproute2 ufw
+  # wireguard-tools is for OPERATOR diagnostics only (sudo wg show etc.);
+  # embernetlite owns the kernel WG interface via netlink and does NOT
+  # require the userspace `wg` tool to function. Including it here so
+  # field debugging of handshake/peer state is one command away.
+  apt-get install -y curl wget openssl podman dnsutils jq iproute2 ufw wireguard-tools
 
   # --- Fix podman CNI configuration ---
   # Gotchas table: K3s install wipes /etc/cni/net.d which destroys
