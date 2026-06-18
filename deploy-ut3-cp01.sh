@@ -32,20 +32,19 @@
 # enrollment via AAD device-code browser flow, re-run for Phase 2
 # (K3s server install on embernet0).
 #
-# All non-K3s workloads run as host-level podman containers
-# (Quadlet or `podman run` + `podman generate systemd`). No K8s
-# pods are scheduled by this script — the cluster starts empty and
-# receives App Store apps later from the EmberNet dashboard.
+# CP-01 is a MINIMAL HA control plane: only embernetlite + K3s join.
+# Trane uses Fireball-hosted Ignition Cloud (NOT installed here);
+# Ignition Edge + CODESYS land on the K3s cluster as pods via the
+# dashboard's App Store after CP-01 has joined. Postgres lives on
+# CP-02 (the seed) and is reachable via cluster networking — no
+# duplicate Postgres on this box.
 #
 # Workloads on CP-01:
-#   - embernetlite (Quadlet, ghcr.io/embernet-ai/embernetlite:0.0.36)
+#   - embernetlite (podman, ghcr.io/embernet-ai/embernetlite:0.0.43)
 #       This IS the VPN: ships its own WireGuard driver and brings up
 #       `embernet0` post-enrollment. The operator must complete enrollment
 #       via AAD device-code (browser) after Phase 1 finishes. Re-run the
 #       script to advance to Phase 2 (K3s install on embernet0).
-#   - PostgreSQL 16 (host podman, 127.0.0.1:5432)            [Phase 1]
-#   - Ignition Cloud Edition 8.3.4 (host podman, host:8088)  [Phase 1]
-#   - CODESYS Control SL 4.20 (host podman, host:1217)       [Phase 1]
 #   - K3s server v1.34.5+k3s1 (host install, JOIN to CP-02 seed)  [Phase 2]
 #   - Rancher import (trane-ut3 cluster)                     [Phase 2]
 #
@@ -814,6 +813,41 @@ Stale enrollment detected — wiping daemon state to force fresh AAD device-code
   ip link delete embernet0 2>/dev/null || true
 
   log "Stale state cleared. install_embernetlite will recreate the daemon and gate_on_embernet0 will drive fresh AAD device-code enrollment."
+}
+
+teardown_legacy_workloads() {
+  # Re-running cp01.sh on a box that was previously deployed with the
+  # OLD multi-workload layout (host-podman Postgres + Ignition Cloud +
+  # CODESYS) collides on container names ("ignition-cloud" already in
+  # use, etc.) the next time install_* runs. Trane's new layout puts
+  # those workloads as K3s pods delivered by the dashboard App Store,
+  # so on CP-01 we want them GONE — but networking config (firewall,
+  # crash-reboot, embernet0, K3s state) MUST stay intact.
+  #
+  # Idempotent: each container/unit only touched if present.
+  log "[2.5/11] Tearing down legacy host workloads (Postgres / Ignition / CODESYS)..."
+
+  local legacy_containers=(ignition-cloud ignition-edge postgres codesys)
+  for c in "${legacy_containers[@]}"; do
+    if podman container exists "$c" 2>/dev/null; then
+      log "  removing host container: $c"
+      podman stop "$c" >/dev/null 2>&1 || true
+      podman rm -f "$c" >/dev/null 2>&1 || true
+    fi
+    local unit="container-${c}.service"
+    if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -q "^${unit}$"; then
+      log "  disabling systemd unit: $unit"
+      systemctl disable --now "$unit" >/dev/null 2>&1 || true
+      rm -f "/etc/systemd/system/${unit}"
+    fi
+  done
+  systemctl daemon-reload 2>/dev/null || true
+
+  # Data dirs intentionally LEFT IN PLACE under /opt/embernet/* — they
+  # may hold operator data the customer wants to preserve / migrate.
+  # Operator can wipe explicitly:
+  #   rm -rf /opt/embernet/{ignition-cloud,ignition-edge,postgres,codesys}
+  log "[2.5/11] Legacy host workloads removed (networking + embernet + K3s untouched)"
 }
 
 install_embernetlite() {
@@ -1798,13 +1832,17 @@ echo "  VPN: embernetlite (EmbernetEndpoint-Linux v0.0.29) → embernet0"
 echo "============================================================"
 echo ""
 
-# Phase 1 — host containers + embernetlite Quadlet (no K3s yet):
+# Phase 1 — embernetlite container only (NO Postgres / Ignition / CODESYS
+# on CP-01 — those workloads live on CP-02, the seed, and CP-01 reaches
+# them via K3s cluster networking once join succeeds. CP-01's job is to
+# add control-plane redundancy + embernet0 mesh presence, nothing more):
 preflight_checks
 configure_firewall
 configure_crash_reboot
-install_postgres
-install_ignition_cloud
-install_codesys
+# Remove any host-installed Postgres / Ignition / CODESYS from a
+# prior multi-workload deploy. Networking config and embernet0 state
+# stay intact.
+teardown_legacy_workloads
 # Self-heal a stale embernet enrollment from a prior run (rx=0 / no
 # handshake against the hub) BEFORE install_embernetlite so the
 # fresh-container path takes over. No-op on a truly fresh box.
@@ -1815,7 +1853,7 @@ install_embernetlite
 # AAD device-code enrollment yet (embernet0 is the gate).
 gate_on_embernet0
 
-# Phase 2 — K3s on embernet0 (JOIN CP-02's existing HA cluster), then Rancher import:
+# Phase 2 — K3s JOIN CP-02's existing HA cluster, then Rancher import:
 install_k3s_server_join
 import_rancher
 print_summary
