@@ -110,7 +110,7 @@ CODESYS_IMAGE="localhost/embernet/codesys-sl:4.20.0.0"
 # (Pull= rename, EnvironmentFile= removal). Do NOT roll back to
 # :stable or :latest until 0.0.30+ ships with non-interactive
 # enrollment.
-EMBERNET_IMAGE="ghcr.io/embernet-ai/embernetlite:0.0.36"
+EMBERNET_IMAGE="ghcr.io/embernet-ai/embernetlite:0.0.43"
 
 # K3s — host install, AGENT joining CP-01's HA cluster. Agents do NOT
 # carry etcd and do NOT serve the API; the install command below uses
@@ -655,6 +655,21 @@ install_embernetlite() {
   # ownership as root so config drops by the operator survive container
   # restarts.
 
+  # v0.0.43 BUG-272 migration: persist tenant_id + device_name so the
+  # daemon's register-on-startup path can refresh os_version +
+  # client_version on the dashboard every boot. Before this, the
+  # dashboard's row showed whatever the original interactive
+  # enrollment wrote ("Alpine v3.20 / v0.0.24-dev" on Trane CP-02
+  # through three daemon upgrades) because the /heartbeat handler
+  # doesn't touch those two columns. Files are mode 0644 — public
+  # data, no secrets. tenant_id is constant for all UT3 boxes (one
+  # site, one tenant). Idempotent — daemon only reads at startup, so
+  # an in-flight write is harmless.
+  echo "tranetech-ut3" > /var/lib/embernet/tenant.id
+  echo "${NODE_NAME}"  > /var/lib/embernet/device.name
+  chmod 0644 /var/lib/embernet/tenant.id /var/lib/embernet/device.name
+  log "Wrote /var/lib/embernet/{tenant.id,device.name} for v0.0.43+ register-on-startup"
+
   # Tear down any legacy flux-edge-tunnel artifacts from the old CP-01
   # script (the openziti host install). embernetlite supersedes it.
   if systemctl list-unit-files 2>/dev/null | grep -q '^ziti'; then
@@ -733,6 +748,7 @@ install_embernetlite() {
     --cap-add=CAP_NET_RAW \
     --device=/dev/net/tun \
     -v /etc/embernet:/etc/embernet:ro,Z \
+    -v /etc/os-release:/etc/os-release:ro,Z \
     -v /var/lib/embernet:/var/lib/embernet:Z \
     -v /var/log/embernet:/var/log/embernet:Z \
     -v /run/embernet:/run/embernet:Z \
@@ -1448,6 +1464,25 @@ print_summary() {
   echo "  Re-run `sudo bash trane/deploy-ut3-en01.sh` — the script will"
   echo "  prompt with a device code + URL, walk you through tenant pick if"
   echo "  needed, and wait for ${EMBERNET_IFACE} to come up before K3s."
+  echo ""
+  echo "  --- REQUIRED: Patch cluster CR agentEnvVars (one-time, mgmt-side) ---"
+  echo "  Without this, Rancher will show this cluster as Unavailable forever"
+  echo "  even though the agent pod is healthy. See trane/docs/TRANE-UT3-DEPLOY.md"
+  echo "  Step 4.5 + industrial-dashboard/.agent/workflows/rancher-cluster-join-pattern.md."
+  echo ""
+  echo "  Patrick (or whoever has embernet-005 kubectl access) must run:"
+  echo ""
+  echo "    ssh embernet-005"
+  echo "    sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get cluster.management.cattle.io"
+  echo "    # find this cluster's c-XXXX ID, then:"
+  echo "    sudo KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl patch cluster.management.cattle.io <CLUSTER_ID> \\"
+  echo "      --type=merge -p '{\"spec\":{\"agentEnvVars\":[{\"name\":\"CATTLE_AGENT_STRICT_VERIFY\",\"value\":\"false\"},{\"name\":\"STRICT_VERIFY\",\"value\":\"false\"}]}}'"
+  echo ""
+  echo "  Then bounce the agent on this node:"
+  echo "    sudo k3s kubectl -n cattle-system delete pod -l app=cattle-cluster-agent"
+  echo ""
+  echo "  Within ~60s the cluster's Connected condition flips to True."
+  echo "  Skip this and the cluster will appear Unavailable in Rancher + the dashboard."
   echo "============================================================"
 }
 
