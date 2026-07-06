@@ -105,30 +105,20 @@ install_endpoint() {
 # =============================================================
 wait_for_enrollment() {
   log "[2/4] Waiting for EmbernetEndpoint enrollment (embernet0 -> ${TRANE_SUBNET_PREFIX}x)..."
-  # Surface the daemon's auto-issued Azure AD device code INLINE. The
-  # endpoint container runs detached, so its console goes to the podman
-  # log; we pull the code out and print it here so no second shell is
-  # needed. Do NOT run a separate 'embernetlite enroll' — the daemon
-  # already runs the wizard.
-  log "Fetching the Azure AD device code from the endpoint (tenant ${TENANT})..."
-  local dc="" t=0
-  while (( t < 60 )); do
-    dc="$(podman logs embernet 2>&1 | sed -nE 's/.*user_code"?[=: ]+"?([A-Za-z0-9-]{4,}).*/\1/p' | tail -1 || true)"
-    [[ -n "$dc" ]] && break
-    ip -4 -o addr show embernet0 2>/dev/null | grep -q "${TRANE_SUBNET_PREFIX}" && break
-    sleep 5; t=$((t+5))
-  done
-  if [[ -n "$dc" ]]; then
-    echo
-    echo "  ============================================================"
-    echo "  AZURE AD DEVICE LOGIN — do this now to enroll ${NODE_NAME_LOWER}:"
-    echo "    1. open   https://microsoft.com/devicelogin"
-    echo "    2. enter  ${dc}"
-    echo "  ============================================================"
-    echo "  (full live log if needed: sudo podman logs -f embernet)"
-    echo
+  # The endpoint daemon does NOT auto-issue a device code — the enroll
+  # wizard does, and it prints the code to THIS terminal. Run it inline
+  # (skip if embernet0 is already up from a prior enrollment). The wizard
+  # blocks until the operator completes the browser device-login.
+  if ip -4 -o addr show embernet0 2>/dev/null | grep -q "${TRANE_SUBNET_PREFIX}"; then
+    log "Endpoint already enrolled (embernet0 is up) — skipping enroll."
   else
-    warn "No device code in the log yet — watch it directly: sudo podman logs -f embernet"
+    echo
+    log "Enrolling endpoint into ${TENANT}. A device code prints below —"
+    log "open https://microsoft.com/devicelogin in a browser and enter it:"
+    echo
+    podman exec -it embernet embernetlite enroll \
+      || warn "enroll wizard exited non-zero; if embernet0 doesn't come up, re-run: sudo podman exec -it embernet embernetlite enroll"
+    echo
   fi
   local waited=0 max=1800 ip=""
   while (( waited < max )); do
