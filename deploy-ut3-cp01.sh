@@ -82,6 +82,10 @@ enroll_endpoint() {
   podman exec -it embernet embernetlite enroll --device-name "${DEVICE_NAME}" \
     || warn "enroll exited non-zero; re-run if needed: sudo podman exec -it embernet embernetlite enroll --device-name ${DEVICE_NAME}"
   echo
+  # The running daemon does not hot-reload a re-enrollment; restart so it
+  # applies the new WireGuard config and brings embernet0 up on the new IP.
+  log "Restarting endpoint so the daemon applies the enrollment..."
+  podman restart embernet >/dev/null 2>&1 || true
   log "Waiting for embernet0 to obtain a ${TRANE_SUBNET_PREFIX}x address..."
   local w=0
   while (( w < 300 )); do

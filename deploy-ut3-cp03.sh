@@ -111,16 +111,19 @@ wait_for_enrollment() {
   # wizard does, and it prints the code to THIS terminal. Run it inline
   # (skip if embernet0 is already up from a prior enrollment). The wizard
   # blocks until the operator completes the browser device-login.
-  if ip -4 -o addr show embernet0 2>/dev/null | grep -q "${TRANE_SUBNET_PREFIX}"; then
-    log "Endpoint already enrolled (embernet0 is up) — skipping enroll."
+  if [[ "$(cat /var/lib/embernet/device.name 2>/dev/null || true)" == "Trane-UT3-CP-03" ]] \
+     && ip -4 -o addr show embernet0 2>/dev/null | grep -q "${TRANE_SUBNET_PREFIX}"; then
+    log "Already enrolled as Trane-UT3-CP-03 (embernet0 up) — skipping enroll."
   else
     echo
-    log "Enrolling endpoint into ${TENANT}. A device code prints below —"
+    log "Enrolling endpoint as Trane-UT3-CP-03. A device code prints below —"
     log "open https://microsoft.com/devicelogin in a browser and enter it:"
     echo
     podman exec -it embernet embernetlite enroll --device-name "Trane-UT3-CP-03" \
       || warn "enroll exited non-zero; re-run if needed: sudo podman exec -it embernet embernetlite enroll --device-name Trane-UT3-CP-03"
     echo
+    log "Restarting endpoint so the daemon applies the enrollment..."
+    podman restart embernet >/dev/null 2>&1 || true
   fi
   local waited=0 max=1800 ip=""
   while (( waited < max )); do
