@@ -107,12 +107,15 @@ wait_for_enrollment() {
   log "[2/4] Waiting for EmbernetEndpoint enrollment (embernet0 -> ${TRANE_SUBNET_PREFIX}x)..."
   cat <<EOF
 
-  Complete enrollment now (AAD device-code, tenant = ${TENANT}):
+  The endpoint daemon auto-issues an Azure AD device code on first start
+  (tenant = ${TENANT}). Watch for it in the container log:
 
-      sudo podman exec -it embernet embernetlite enroll
+      sudo podman logs -f embernet
 
-  This script continues automatically once embernet0 comes up inside
-  ${TRANE_SUBNET_PREFIX}0/24.
+  Take the value from the "user_code" line, open https://microsoft.com/devicelogin
+  in a browser, and enter it. Do NOT run a separate 'embernetlite enroll' —
+  the daemon already runs the wizard. This script continues automatically
+  once embernet0 comes up inside ${TRANE_SUBNET_PREFIX}0/24.
 
 EOF
   local waited=0 max=1800 ip=""
