@@ -152,11 +152,10 @@ wait_for_enrollment() {
 # =============================================================
 install_k3s_server() {
   log "[3/4] Installing K3s server (HA join to CP-02)..."
-  [[ -s "$K3S_TOKEN_FILE" ]] || fail "Missing cluster join token at ${K3S_TOKEN_FILE}.
-      Fetch it from CP-02:
-        sudo scp user@${SEED_IP}:/etc/embernet/k3s-token ${K3S_TOKEN_FILE}
-        sudo chmod 600 ${K3S_TOKEN_FILE}"
-  local token; token="$(tr -d '[:space:]' < "$K3S_TOKEN_FILE")"
+  # CP-02 shared cluster token, baked in for the ephemeral demo cluster.
+  # Override with K3S_TOKEN env or a /etc/embernet/k3s-token file if it rotates.
+  local token="${K3S_TOKEN:-72d6bbbe257a0ac028cde59d4c1ab413cb5694f3cec2a37b411efcdd936172a3}"
+  [[ -s "$K3S_TOKEN_FILE" ]] && token="$(tr -d '[:space:]' < "$K3S_TOKEN_FILE")"
 
   mkdir -p /etc/rancher/k3s
   printf 'disable-network-policy: true\n' > /etc/rancher/k3s/config.yaml
