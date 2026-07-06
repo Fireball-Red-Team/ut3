@@ -115,7 +115,7 @@ wait_for_enrollment() {
   log "Fetching the Azure AD device code from the endpoint (tenant ${TENANT})..."
   local dc="" t=0
   while (( t < 60 )); do
-    dc="$(podman logs embernet 2>&1 | grep -aoiE 'user_code[=: ]+[A-Za-z0-9-]+' | tail -1 || true)"
+    dc="$(podman logs embernet 2>&1 | sed -nE 's/.*user_code"?[=: ]+"?([A-Za-z0-9-]{4,}).*/\1/p' | tail -1 || true)"
     [[ -n "$dc" ]] && break
     ip -4 -o addr show embernet0 2>/dev/null | grep -q "${TRANE_SUBNET_PREFIX}" && break
     sleep 5; t=$((t+5))
@@ -125,7 +125,7 @@ wait_for_enrollment() {
     echo "  ============================================================"
     echo "  AZURE AD DEVICE LOGIN — do this now to enroll ${NODE_NAME_LOWER}:"
     echo "    1. open   https://microsoft.com/devicelogin"
-    echo "    2. enter  ${dc##*[=: ]}"
+    echo "    2. enter  ${dc}"
     echo "  ============================================================"
     echo "  (full live log if needed: sudo podman logs -f embernet)"
     echo
