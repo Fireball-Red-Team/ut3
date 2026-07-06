@@ -105,19 +105,31 @@ install_endpoint() {
 # =============================================================
 wait_for_enrollment() {
   log "[2/4] Waiting for EmbernetEndpoint enrollment (embernet0 -> ${TRANE_SUBNET_PREFIX}x)..."
-  cat <<EOF
-
-  The endpoint daemon auto-issues an Azure AD device code on first start
-  (tenant = ${TENANT}). Watch for it in the container log:
-
-      sudo podman logs -f embernet
-
-  Take the value from the "user_code" line, open https://microsoft.com/devicelogin
-  in a browser, and enter it. Do NOT run a separate 'embernetlite enroll' —
-  the daemon already runs the wizard. This script continues automatically
-  once embernet0 comes up inside ${TRANE_SUBNET_PREFIX}0/24.
-
-EOF
+  # Surface the daemon's auto-issued Azure AD device code INLINE. The
+  # endpoint container runs detached, so its console goes to the podman
+  # log; we pull the code out and print it here so no second shell is
+  # needed. Do NOT run a separate 'embernetlite enroll' — the daemon
+  # already runs the wizard.
+  log "Fetching the Azure AD device code from the endpoint (tenant ${TENANT})..."
+  local dc="" t=0
+  while (( t < 60 )); do
+    dc="$(podman logs embernet 2>&1 | grep -aoiE 'user_code[=: ]+[A-Za-z0-9-]+' | tail -1 || true)"
+    [[ -n "$dc" ]] && break
+    ip -4 -o addr show embernet0 2>/dev/null | grep -q "${TRANE_SUBNET_PREFIX}" && break
+    sleep 5; t=$((t+5))
+  done
+  if [[ -n "$dc" ]]; then
+    echo
+    echo "  ============================================================"
+    echo "  AZURE AD DEVICE LOGIN — do this now to enroll ${NODE_NAME_LOWER}:"
+    echo "    1. open   https://microsoft.com/devicelogin"
+    echo "    2. enter  ${dc##*[=: ]}"
+    echo "  ============================================================"
+    echo "  (full live log if needed: sudo podman logs -f embernet)"
+    echo
+  else
+    warn "No device code in the log yet — watch it directly: sudo podman logs -f embernet"
+  fi
   local waited=0 max=1800 ip=""
   while (( waited < max )); do
     ip="$(ip -4 -o addr show embernet0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep "^${TRANE_SUBNET_PREFIX}" || true)"
