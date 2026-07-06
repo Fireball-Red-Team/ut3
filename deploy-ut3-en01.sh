@@ -116,8 +116,8 @@ wait_for_enrollment() {
     log "Enrolling endpoint into ${TENANT}. A device code prints below —"
     log "open https://microsoft.com/devicelogin in a browser and enter it:"
     echo
-    podman exec -it embernet embernetlite enroll \
-      || warn "enroll wizard exited non-zero; if embernet0 doesn't come up, re-run: sudo podman exec -it embernet embernetlite enroll"
+    podman exec -it embernet embernetlite enroll --device-name "Trane-UT3-EN-0001" \
+      || warn "enroll exited non-zero; re-run if needed: sudo podman exec -it embernet embernetlite enroll --device-name Trane-UT3-EN-0001"
     echo
   fi
   local waited=0 max=1800 ip=""
