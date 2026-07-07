@@ -78,6 +78,24 @@ ensure_prereqs() {
 }
 ensure_prereqs
 
+# --- Preflight: the Flux dial needs a one-time enrollment JWT. Verify it is
+#     present BEFORE the interactive endpoint enrollment, so a missing JWT
+#     fails FAST instead of after the operator completes the device-code login.
+#     (Skipped when the identity is already enrolled in the volume.)
+preflight_flux_jwt() {
+  local vol=""
+  if podman volume inspect embernet-flux-identity >/dev/null 2>&1; then
+    vol="$(podman volume inspect embernet-flux-identity --format '{{.Mountpoint}}')"
+  fi
+  if [[ -n "$vol" && -s "${vol}/${FLUX_IDENTITY_NAME}.json" ]]; then return 0; fi
+  if [[ -n "${FLUX_ENROLLMENT_JWT:-}" || -s "$FLUX_JWT_FILE" ]]; then return 0; fi
+  fail "Missing the one-time Flux enrollment JWT for ${FLUX_IDENTITY_NAME}.
+      Stage it FIRST so the endpoint device-login is not wasted:
+        sudo mkdir -p /etc/embernet
+        echo '<paste the ${FLUX_IDENTITY_NAME} JWT>' | sudo tee ${FLUX_JWT_FILE} >/dev/null
+      then re-run: sudo bash ${0##*/}"
+}
+
 # --- [1/4] EmbernetEndpoint container (mesh IP + dashboard) ------------------
 install_endpoint() {
   if podman ps --format '{{.Names}}' 2>/dev/null | grep -qx embernet; then
@@ -267,6 +285,7 @@ log "=== Trane UT3 EN-0002 — endpoint (${DEVICE_NAME}) + Flux dial + join CP-0
 # SKIP_ENDPOINT=1 -> Flux-only join: no EmbernetEndpoint install/enroll, no
 # device-code login. The Ziti dial (flux-edge-tunnel) does the cluster join;
 # --node-ip falls back to the box's default-route IP when embernet0 is absent.
+preflight_flux_jwt   # JWT must be staged before the endpoint enroll
 if [[ "${SKIP_ENDPOINT:-0}" == "1" ]]; then
   log "SKIP_ENDPOINT=1 — skipping EmbernetEndpoint install + enroll (no device login)."
 else
