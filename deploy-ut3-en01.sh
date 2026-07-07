@@ -156,8 +156,10 @@ Restart=always
 TimeoutStopSec=70
 ExecStartPre=/bin/rm -f %t/%n.ctr-id
 ExecStart=/usr/bin/podman run --cidfile=%t/%n.ctr-id --cgroups=no-conmon --rm --sdnotify=conmon --replace -d --name embernet-flux-edge-tunnel --network=host --privileged -v embernet-flux-identity:/ziti-identity -e ZITI_IDENTITY_DIR=/ziti-identity -e ZITI_IDENTITY_BASENAME=${FLUX_IDENTITY_NAME} -e ZITI_CONTROLLER_URL=https://flux.embernet.ai:443 -e PFXLOG_NO_JSON=true ${FLUX_TUNNEL_IMAGE} proxy ${FLUX_SERVICE}:${FLUX_LOCAL_PORT}
+ExecStartPost=/bin/sh -c 'iptables -t nat -C OUTPUT -p tcp -d ${SEED_IP} --dport 6443 -j REDIRECT --to-ports ${FLUX_LOCAL_PORT} 2>/dev/null || iptables -t nat -A OUTPUT -p tcp -d ${SEED_IP} --dport 6443 -j REDIRECT --to-ports ${FLUX_LOCAL_PORT}'
 ExecStop=/usr/bin/podman stop --ignore --cidfile=%t/%n.ctr-id
 ExecStopPost=/usr/bin/podman rm -f --ignore --cidfile=%t/%n.ctr-id
+ExecStopPost=/bin/sh -c 'iptables -t nat -D OUTPUT -p tcp -d ${SEED_IP} --dport 6443 -j REDIRECT --to-ports ${FLUX_LOCAL_PORT} 2>/dev/null || true'
 Type=notify
 NotifyAccess=all
 [Install]
@@ -166,6 +168,19 @@ UNIT
 
   systemctl daemon-reload
   systemctl enable --now embernet-flux-edge-tunnel.service >/dev/null 2>&1 || true
+
+  # apiserver-IP redirect: k3s agents auto-discover CP-02's ADVERTISED apiserver
+  # (${SEED_IP}:6443) and switch their load balancer to dial it directly — which
+  # is dead over WireGuard, so the node goes NotReady ~1 min after joining.
+  # Route that IP into the local Flux proxy. (The unit's ExecStartPost makes this
+  # reboot-durable; this handles the already-running / re-run case.)
+  if command -v iptables >/dev/null; then
+    iptables -t nat -C OUTPUT -p tcp -d "${SEED_IP}" --dport 6443 -j REDIRECT --to-ports "${FLUX_LOCAL_PORT}" 2>/dev/null \
+      || iptables -t nat -A OUTPUT -p tcp -d "${SEED_IP}" --dport 6443 -j REDIRECT --to-ports "${FLUX_LOCAL_PORT}"
+    log "apiserver redirect installed: ${SEED_IP}:6443 -> local Flux proxy :${FLUX_LOCAL_PORT}."
+  else
+    warn "iptables not found — install it, else k3s dials ${SEED_IP}:6443 directly and the node goes NotReady."
+  fi
 
   log "Waiting for the Flux proxy to bind :${FLUX_LOCAL_PORT}..."
   local w=0
