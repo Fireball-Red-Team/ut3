@@ -1,33 +1,58 @@
 #!/usr/bin/env bash
 # =============================================================
-# Trane UT3 — CP-01 : EmbernetEndpoint (as Trane-UT3-CP-01) + K3s
+# Trane UT3 — CP-01 : join CP-02's trane-ut3 cluster as a k3s AGENT,
+#   with the apiserver dial riding Flux/Ziti (TCP 443) instead of
+#   WireGuard (UDP, blocked on the 10.200.32.x segment).
 #
-# Does the two things, in order:
-#   1. EmbernetEndpoint-Linux  — endpoint container + enroll AS
-#      "Trane-UT3-CP-01" (NOT the hostname), giving embernet0 a
-#      100.64.1.x address in the Trane mesh.
-#   2. K3s server — JOIN the existing Trane cluster seeded by CP-02
-#      (node trane-ut3-cp-02 = the trane-ut3 cluster in Rancher),
-#      via --server https://100.64.1.3:6443. NOT a fresh cluster.
+# Three things, in order:
+#   1. EmbernetEndpoint-Linux — endpoint container + enroll AS
+#      "Trane-UT3-CP-01" (mesh/dashboard identity; gives embernet0 a
+#      100.64.1.x address used as the k3s --node-ip).
+#   2. flux-edge-tunnel — Ziti dial in 'proxy' mode: binds a local
+#      127.0.0.1:6443 listener and tunnels to CP-02's apiserver over
+#      Flux. (embernetlite's own Flux driver is a stub — the real
+#      overlay data plane is this ziti-edge-tunnel container.)
+#   3. K3s AGENT — joins CP-02 via K3S_URL=https://127.0.0.1:6443
+#      (the LOCAL Flux proxy; 127.0.0.1 is a SAN on CP-02's apiserver
+#      cert, so TLS verifies). NOT a server; NOT a fresh cluster.
 #
-# Prereq — CP-02's shared cluster token on this box:
-#   sudo scp user@100.64.1.3:/etc/embernet/k3s-token /etc/embernet/k3s-token
-#   sudo chmod 600 /etc/embernet/k3s-token
+# CP-02 (100.64.1.3, node trane-ut3-cp-02) is the live control plane
+# and is LEFT UNTOUCHED.
+#
+# Prereqs:
+#   1. CP-02 shared cluster token on this box:
+#        sudo scp user@100.64.1.3:/etc/embernet/k3s-token /etc/embernet/k3s-token
+#        sudo chmod 600 /etc/embernet/k3s-token
+#   2. A one-time Flux enrollment JWT for identity "Embernode-UT3-CP01"
+#      (roleAttribute 'trane-ut3'), UNLESS it is already enrolled in the
+#      embernet-flux-identity volume. Provide via env or file:
+#        FLUX_ENROLLMENT_JWT='<jwt>' sudo bash deploy-ut3-cp01.sh
+#        # or: place it at /etc/embernet/flux-cp01.jwt and re-run
 #
 #   sudo bash deploy-ut3-cp01.sh
 # =============================================================
 set -euo pipefail
 
-NODE_NAME_LOWER="trane-ut3-cp-01"     # k3s node name
-DEVICE_NAME="Trane-UT3-CP-01"         # endpoint identity (dashboard/Flux/mesh)
-NODE_ROLE="control-plane"
+NODE_NAME_LOWER="trane-ut3-cp-01"        # k3s node name (preserved)
+DEVICE_NAME="Trane-UT3-CP-01"            # embernetlite endpoint identity (mesh/dashboard)
+FLUX_IDENTITY_NAME="Embernode-UT3-CP01"  # flux-edge-tunnel Ziti identity (apiserver dial)
+NODE_ROLE="edge"                         # was 'control-plane' — CP-01 now joins as an agent/worker
 TENANT="tranetech-ut3"
-SEED_URL="https://100.64.1.3:6443"
-SEED_IP="100.64.1.3"
+
+# The apiserver is dialed through the LOCAL Flux proxy (see install_flux_tunnel).
+# 127.0.0.1 is a SAN on CP-02's apiserver cert, so the agent's TLS verifies.
+APISERVER_URL="https://127.0.0.1:6443"
+SEED_IP="100.64.1.3"                     # CP-02 mesh IP (kept only for the node-ip collision guard)
 TRANE_SUBNET_PREFIX="100.64.1."
+
 EMBERNET_IMAGE="ghcr.io/embernet-ai/embernetlite:0.0.47"
+FLUX_TUNNEL_IMAGE="ghcr.io/embernet-ai/flux-edge-tunnel:latest"
+FLUX_SERVICE="trane-ut3-k3s-api"         # Ziti service; its bind is hosted by CP-02
+FLUX_LOCAL_PORT="6443"                   # local port the Flux proxy binds
+FLUX_JWT_FILE="/etc/embernet/flux-cp01.jwt"
+
 K3S_VERSION="v1.34.5+k3s1"
-K3S_INSTALL_NAME="embernet-server"
+K3S_INSTALL_NAME="embernet-agent"        # was embernet-server -> unit k3s-embernet-agent.service
 K3S_TOKEN_FILE="/etc/embernet/k3s-token"
 
 log()  { printf '\n[+] %s\n' "$*"; }
@@ -48,13 +73,13 @@ ensure_prereqs() {
 }
 ensure_prereqs
 
-# --- [1/4] EmbernetEndpoint container ---------------------------------------
+# --- [1/5] EmbernetEndpoint container (mesh IP + dashboard) ------------------
 install_endpoint() {
   if podman ps --format '{{.Names}}' 2>/dev/null | grep -qx embernet; then
-    log "[1/4] Endpoint container already running."
+    log "[1/5] Endpoint container already running."
     return 0
   fi
-  log "[1/4] Installing EmbernetEndpoint-Linux (${EMBERNET_IMAGE})..."
+  log "[1/5] Installing EmbernetEndpoint-Linux (${EMBERNET_IMAGE})..."
   mkdir -p /etc/embernet /var/lib/embernet /var/log/embernet /run/embernet
   chown 987:987 /var/lib/embernet /var/log/embernet /run/embernet
   podman pull "${EMBERNET_IMAGE}"
@@ -68,15 +93,15 @@ install_endpoint() {
   systemctl enable podman-restart.service 2>/dev/null || true
 }
 
-# --- [2/4] Enroll AS Trane-UT3-CP-01 ----------------------------------------
+# --- [2/5] Enroll AS Trane-UT3-CP-01 ----------------------------------------
 enroll_endpoint() {
   local current; current="$(cat /var/lib/embernet/device.name 2>/dev/null || true)"
   if [[ "$current" == "$DEVICE_NAME" ]] && ip -4 -o addr show embernet0 2>/dev/null | grep -q "${TRANE_SUBNET_PREFIX}"; then
-    log "[2/4] Already enrolled as ${DEVICE_NAME} (embernet0 up) — skipping."
+    log "[2/5] Already enrolled as ${DEVICE_NAME} (embernet0 up) — skipping."
     return 0
   fi
   echo
-  log "[2/4] Enrolling endpoint as ${DEVICE_NAME}. A device code prints below —"
+  log "[2/5] Enrolling endpoint as ${DEVICE_NAME}. A device code prints below —"
   log "open https://microsoft.com/devicelogin in a browser and enter it:"
   echo
   podman exec -it embernet embernetlite enroll --device-name "${DEVICE_NAME}" \
@@ -94,63 +119,154 @@ enroll_endpoint() {
   done
 }
 
-# --- [3/4] K3s server — JOIN CP-02's Trane cluster --------------------------
-install_k3s() {
-  NODE_IP="$(ip -4 -o addr show embernet0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep "^${TRANE_SUBNET_PREFIX}" | head -1 || true)"
-  [[ -n "$NODE_IP" ]] || fail "embernet0 has no ${TRANE_SUBNET_PREFIX}x address — enrollment incomplete."
-  [[ "$NODE_IP" != "$SEED_IP" ]] || fail "This box's embernet0 (${NODE_IP}) is CP-02's seed IP — wrong box."
-  log "[3/4] CP-01 mesh IP: ${NODE_IP}"
+# --- [3/5] flux-edge-tunnel: the Ziti dial (proxy mode, no TUN, no DNS) ------
+install_flux_tunnel() {
+  log "[3/5] Deploying flux-edge-tunnel (Ziti dial, 'proxy' mode)..."
+  podman pull "${FLUX_TUNNEL_IMAGE}" 2>/dev/null || true
+  podman volume inspect embernet-flux-identity >/dev/null 2>&1 || podman volume create embernet-flux-identity >/dev/null
+  local vol; vol="$(podman volume inspect embernet-flux-identity --format '{{.Mountpoint}}')"
 
-  (echo >"/dev/tcp/${SEED_IP}/6443") 2>/dev/null \
-    && log "CP-02 apiserver ${SEED_IP}:6443 reachable." \
-    || warn "Cannot reach ${SEED_IP}:6443 yet — join will retry."
+  if [[ -s "${vol}/${FLUX_IDENTITY_NAME}.json" ]]; then
+    log "Flux identity ${FLUX_IDENTITY_NAME} already enrolled — reusing (no JWT needed)."
+  else
+    local jwt="${FLUX_ENROLLMENT_JWT:-}"
+    [[ -z "$jwt" && -s "$FLUX_JWT_FILE" ]] && jwt="$(cat "$FLUX_JWT_FILE")"
+    [[ -n "$jwt" ]] || fail "flux-edge-tunnel needs a one-time enrollment JWT for ${FLUX_IDENTITY_NAME}.
+      Mint it at the Flux controller (identity ${FLUX_IDENTITY_NAME}, roleAttribute 'trane-ut3'), then:
+        FLUX_ENROLLMENT_JWT='<jwt>' sudo bash $(basename "$0")
+      or place the JWT at ${FLUX_JWT_FILE} and re-run."
+    printf '%s' "$jwt" > "${vol}/${FLUX_IDENTITY_NAME}.jwt"
+    chmod 600 "${vol}/${FLUX_IDENTITY_NAME}.jwt"
+    log "Staged one-time enrollment JWT (consumed on first boot; identity then persists in the volume)."
+  fi
+
+  # systemd unit mirrors CP-02's proven flux-edge-tunnel unit, but in 'proxy'
+  # mode: binds :${FLUX_LOCAL_PORT} locally and forwards ${FLUX_SERVICE} over Flux.
+  cat > /etc/systemd/system/embernet-flux-edge-tunnel.service <<UNIT
+[Unit]
+Description=Embernet Flux Edge Tunnel (proxy ${FLUX_SERVICE} -> 127.0.0.1:${FLUX_LOCAL_PORT})
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=%t/containers
+[Service]
+Environment=PODMAN_SYSTEMD_UNIT=%n
+Restart=always
+TimeoutStopSec=70
+ExecStartPre=/bin/rm -f %t/%n.ctr-id
+ExecStart=/usr/bin/podman run --cidfile=%t/%n.ctr-id --cgroups=no-conmon --rm --sdnotify=conmon --replace -d --name embernet-flux-edge-tunnel --network=host --privileged -v embernet-flux-identity:/ziti-identity -e ZITI_IDENTITY_DIR=/ziti-identity -e ZITI_IDENTITY_BASENAME=${FLUX_IDENTITY_NAME} -e ZITI_CONTROLLER_URL=https://flux.embernet.ai:443 -e PFXLOG_NO_JSON=true ${FLUX_TUNNEL_IMAGE} proxy ${FLUX_SERVICE}:${FLUX_LOCAL_PORT}
+ExecStop=/usr/bin/podman stop --ignore --cidfile=%t/%n.ctr-id
+ExecStopPost=/usr/bin/podman rm -f --ignore --cidfile=%t/%n.ctr-id
+Type=notify
+NotifyAccess=all
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  systemctl daemon-reload
+  systemctl enable --now embernet-flux-edge-tunnel.service >/dev/null 2>&1 || true
+
+  log "Waiting for the Flux proxy to bind :${FLUX_LOCAL_PORT}..."
+  local w=0
+  while (( w < 150 )); do
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${FLUX_LOCAL_PORT}\$" && break
+    sleep 3; w=$((w+3))
+  done
+  ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE ":${FLUX_LOCAL_PORT}\$" \
+    || fail "flux-edge-tunnel proxy never bound :${FLUX_LOCAL_PORT}. Inspect: podman logs embernet-flux-edge-tunnel"
+  local code; code="$(curl -sk --max-time 10 -o /dev/null -w '%{http_code}' "https://127.0.0.1:${FLUX_LOCAL_PORT}/healthz" 2>/dev/null || true)"
+  if [[ "$code" =~ ^(200|401|403)$ ]]; then
+    log "[3/5] Flux proxy up — CP-02 apiserver reachable over Ziti (HTTP ${code})."
+  else
+    warn "Proxy bound but apiserver not answering yet (HTTP '${code}'); k3s agent will retry."
+  fi
+}
+
+# --- [4a] Tear down any prior k3s SERVER install (A6) -----------------------
+teardown_server_remnants() {
+  # CP-01 previously had a (failed/partial) k3s SERVER install. Remove it
+  # before installing the agent. GUARD: never tear down a HEALTHY control
+  # plane (protects against running this edge script on CP-02 by mistake).
+  if systemctl is-active --quiet k3s-embernet-server 2>/dev/null \
+     && [[ -f /etc/rancher/k3s/k3s.yaml ]] \
+     && /usr/local/bin/k3s kubectl get nodes 2>/dev/null | grep -qiE 'control-plane.*ready|ready.*control-plane'; then
+    fail "A healthy k3s control-plane server is running on this box — refusing to uninstall.
+      This edge script must NOT be run on a live control plane (CP-02?)."
+  fi
+  local did=0 u
+  for u in /usr/local/bin/k3s-embernet-server-uninstall.sh /usr/local/bin/k3s-server-uninstall.sh; do
+    if [[ -x "$u" ]]; then warn "Removing prior k3s server install via ${u} ..."; "$u" || true; did=1; fi
+  done
+  (( did )) && log "[4/5] Prior k3s server remnants removed." || true
+}
+
+# --- [4b] K3s AGENT — join CP-02 over the local Flux proxy -------------------
+install_k3s() {
+  if [[ -x /usr/local/bin/k3s ]] && systemctl is-active --quiet "k3s-${K3S_INSTALL_NAME}" 2>/dev/null; then
+    log "[4/5] k3s-${K3S_INSTALL_NAME} already active — nothing to install."
+    return 0
+  fi
+  # node-ip: prefer embernet0's mesh IP (matches cluster addressing); if
+  # embernet0 is absent, fall back to the default-route source IP.
+  local node_ip flannel_flag=""
+  node_ip="$(ip -4 -o addr show embernet0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep "^${TRANE_SUBNET_PREFIX}" | head -1 || true)"
+  [[ -n "$node_ip" ]] || node_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  [[ -n "$node_ip" ]] || fail "Could not determine a node IP for ${NODE_NAME_LOWER}."
+  [[ "$node_ip" != "$SEED_IP" ]] || fail "This box's node IP (${node_ip}) is CP-02's seed IP — wrong box."
+  # flannel-iface only if embernet0 exists (cross-node pod traffic still needs
+  # WG/a TCP CNI path; nodes are Ready + schedulable regardless — see limits).
+  ip link show embernet0 >/dev/null 2>&1 && flannel_flag="--flannel-iface=embernet0"
+
+  log "[4/5] CP-01 node IP: ${node_ip}; dialing apiserver via local Flux proxy ${APISERVER_URL}"
+  (echo >"/dev/tcp/127.0.0.1/${FLUX_LOCAL_PORT}") 2>/dev/null \
+    && log "Local Flux proxy :${FLUX_LOCAL_PORT} reachable." \
+    || warn "Local Flux proxy :${FLUX_LOCAL_PORT} not reachable yet — join will retry."
 
   # CP-02 shared cluster token, baked in for the ephemeral demo cluster.
   # Override with K3S_TOKEN env or a /etc/embernet/k3s-token file if it rotates.
   local token="${K3S_TOKEN:-72d6bbbe257a0ac028cde59d4c1ab413cb5694f3cec2a37b411efcdd936172a3}"
   [[ -s "$K3S_TOKEN_FILE" ]] && token="$(tr -d '[:space:]' < "$K3S_TOKEN_FILE")"
 
-  if [[ -x /usr/local/bin/k3s ]] && systemctl is-active --quiet "k3s-${K3S_INSTALL_NAME}" 2>/dev/null; then
-    log "k3s-${K3S_INSTALL_NAME} already active — nothing to install."
-    return 0
-  fi
-  mkdir -p /etc/rancher/k3s
-  printf 'disable-network-policy: true\n' > /etc/rancher/k3s/config.yaml
-  log "Installing k3s server, JOINING the Trane cluster at ${SEED_URL}..."
+  log "Installing k3s agent, joining the Trane cluster via ${APISERVER_URL}..."
   curl -sfL https://get.k3s.io | \
-    INSTALL_K3S_VERSION="${K3S_VERSION}" INSTALL_K3S_NAME="${K3S_INSTALL_NAME}" K3S_TOKEN="${token}" \
-    sh -s - server \
-      --server "${SEED_URL}" \
+    INSTALL_K3S_VERSION="${K3S_VERSION}" INSTALL_K3S_NAME="${K3S_INSTALL_NAME}" \
+    K3S_URL="${APISERVER_URL}" K3S_TOKEN="${token}" \
+    sh -s - agent \
       --node-name="${NODE_NAME_LOWER}" \
-      --node-ip="${NODE_IP}" \
-      --flannel-iface=embernet0 \
-      --tls-san="${NODE_IP}" \
-      --disable=traefik \
+      --node-ip="${node_ip}" \
+      ${flannel_flag} \
       --node-label="embernet.ai/tenant=${TENANT}" \
       --node-label="embernet.ai/site=ut3" \
       --node-label="embernet.ai/role=${NODE_ROLE}" \
       --node-label="embernet.ai/node-name=${NODE_NAME_LOWER}"
 }
 
-# --- [4/4] Verify -----------------------------------------------------------
+# --- [5/5] Verify — agents have no local kubeconfig ------------------------
 verify() {
-  export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
-  log "[4/4] Waiting for ${NODE_NAME_LOWER} to register Ready (max 180s)..."
+  log "[5/5] Verifying k3s-${K3S_INSTALL_NAME}.service..."
   local w=0
-  while (( w < 180 )); do
-    if /usr/local/bin/k3s kubectl get node "${NODE_NAME_LOWER}" 2>/dev/null | grep -q ' Ready'; then
-      log "[4/4] ${NODE_NAME_LOWER} is Ready — joined the Trane cluster."
-      /usr/local/bin/k3s kubectl get nodes -o wide 2>/dev/null | grep -E "NAME|trane-ut3" || true
-      return 0
-    fi
+  while (( w < 120 )); do
+    systemctl is-active --quiet "k3s-${K3S_INSTALL_NAME}" && break
     sleep 5; w=$((w+5))
   done
-  warn "${NODE_NAME_LOWER} not Ready yet. Inspect: journalctl -xeu k3s-${K3S_INSTALL_NAME} --no-pager -n 60"
+  if systemctl is-active --quiet "k3s-${K3S_INSTALL_NAME}"; then
+    log "[5/5] k3s-${K3S_INSTALL_NAME}.service is active."
+    cat <<EOF
+
+  Confirm the join from CP-02:
+      k3s kubectl get node ${NODE_NAME_LOWER} -o wide
+
+EOF
+  else
+    warn "k3s-${K3S_INSTALL_NAME} not active. Inspect: journalctl -xeu k3s-${K3S_INSTALL_NAME} --no-pager -n 60"
+  fi
 }
 
-log "=== Trane UT3 CP-01 — endpoint (${DEVICE_NAME}) + join CP-02 cluster ==="
+# ---------------- MAIN ----------------
+log "=== Trane UT3 CP-01 — endpoint (${DEVICE_NAME}) + Flux dial + join CP-02 as agent ==="
 install_endpoint
 enroll_endpoint
+install_flux_tunnel
+teardown_server_remnants
 install_k3s
 verify
 log "=== CP-01 done. ==="
