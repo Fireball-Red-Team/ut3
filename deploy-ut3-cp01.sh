@@ -220,6 +220,11 @@ install_k3s() {
     log "[4/5] k3s-${K3S_INSTALL_NAME} already active — nothing to install."
     return 0
   fi
+  # A prior k3s SERVER install may have left /etc/rancher/k3s/config.yaml with
+  # server-only keys (e.g. disable-network-policy); the AGENT reads the same
+  # file, rejects the unknown flag, and exits fatally. Agents need no
+  # config.yaml here — remove any stale one.
+  rm -f /etc/rancher/k3s/config.yaml
   # node-ip: prefer embernet0's mesh IP (matches cluster addressing); if
   # embernet0 is absent, fall back to the default-route source IP.
   local node_ip flannel_flag=""
