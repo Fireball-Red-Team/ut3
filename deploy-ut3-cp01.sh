@@ -283,8 +283,15 @@ EOF
 
 # ---------------- MAIN ----------------
 log "=== Trane UT3 CP-01 — endpoint (${DEVICE_NAME}) + Flux dial + join CP-02 as agent ==="
-install_endpoint
-enroll_endpoint
+# SKIP_ENDPOINT=1 -> Flux-only join: no EmbernetEndpoint install/enroll, no
+# device-code login. The Ziti dial (flux-edge-tunnel) does the cluster join;
+# --node-ip falls back to the box's default-route IP when embernet0 is absent.
+if [[ "${SKIP_ENDPOINT:-0}" == "1" ]]; then
+  log "SKIP_ENDPOINT=1 — skipping EmbernetEndpoint install + enroll (no device login)."
+else
+  install_endpoint
+  enroll_endpoint
+fi
 install_flux_tunnel
 teardown_server_remnants
 install_k3s
