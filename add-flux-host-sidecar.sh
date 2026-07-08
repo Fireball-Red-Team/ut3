@@ -2,13 +2,16 @@
 # =============================================================
 # add-flux-host-sidecar.sh — IN-PLACE, per box. No deploy-script rerun.
 #
-# Adds a SECOND ziti-edge-tunnel container in `run-host` mode so the node
+# Adds a SECOND ziti-edge-tunnel container in `host` mode so the node
 # HOSTS the Flux GUI services The Reconciler provisions (so the dashboard can
 # reach this node's App-Store apps over the overlay when WireGuard can't).
 #
-# `run-host` is host-ONLY: it binds services the identity is allowed to host,
+# `host` is host-ONLY: it binds services the identity is allowed to host,
 # and does NOT intercept/tproxy anything — so it CANNOT disturb the existing
-# apiserver `proxy` sidecar or the k3s join. It reuses the node's existing
+# apiserver `proxy` sidecar or the k3s join. (There is NO `run-host` verb in
+# this image — the modes are host|proxy|run|tproxy; `run-host` prints usage
+# and exits, verified against ghcr.io/embernet-ai/flux-edge-tunnel.) It reuses
+# the node's existing
 # Embernode identity + volume (read-only), auto-detected from the running
 # edge-tunnel unit.
 #
@@ -50,7 +53,7 @@ Environment=PODMAN_SYSTEMD_UNIT=%n
 Restart=always
 TimeoutStopSec=70
 ExecStartPre=/bin/rm -f %t/%n.ctr-id
-ExecStart=/usr/bin/podman run --cidfile=%t/%n.ctr-id --cgroups=no-conmon --rm --sdnotify=conmon --replace -d --name embernet-flux-host --network=host --privileged -v embernet-flux-identity:/ziti-identity -e ZITI_IDENTITY_DIR=/ziti-identity -e ZITI_IDENTITY_BASENAME=${FLUX_IDENTITY_NAME} -e ZITI_CONTROLLER_URL=${CTRL_URL} -e PFXLOG_NO_JSON=true ${FLUX_TUNNEL_IMAGE} run-host
+ExecStart=/usr/bin/podman run --cidfile=%t/%n.ctr-id --cgroups=no-conmon --rm --sdnotify=conmon --replace -d --name embernet-flux-host --network=host --privileged -v embernet-flux-identity:/ziti-identity -e ZITI_IDENTITY_DIR=/ziti-identity -e ZITI_IDENTITY_BASENAME=${FLUX_IDENTITY_NAME} -e ZITI_CONTROLLER_URL=${CTRL_URL} -e PFXLOG_NO_JSON=true ${FLUX_TUNNEL_IMAGE} host
 ExecStop=/usr/bin/podman stop --ignore --cidfile=%t/%n.ctr-id
 ExecStopPost=/usr/bin/podman rm -f --ignore --cidfile=%t/%n.ctr-id
 Type=notify
@@ -69,7 +72,7 @@ while (( w < 60 )); do
   sleep 3; w=$((w+3))
 done
 if podman ps --format '{{.Names}}' 2>/dev/null | grep -qx embernet-flux-host; then
-  echo "[+] embernet-flux-host is running (run-host). It will host every #gui-services"
+  echo "[+] embernet-flux-host is running (host mode). It will host every #gui-services"
   echo "    service this identity may bind. Existing apiserver proxy + k3s untouched."
   echo "    Inspect: podman logs embernet-flux-host | tail; systemctl status embernet-flux-host"
 else
