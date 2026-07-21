@@ -220,7 +220,13 @@ log "Listener up after ${w}s."
 cat > /etc/embernet/k3s-apiserver-redirect.nft <<NFT
 table inet embernet_k3s {
 	chain apiserver_redirect {
-		type nat hook output priority dstnat; policy accept;
+		# -100 NUMERIC, never the symbolic "dstnat". nft 0.9.x (Ubuntu 22.04,
+		# /usr/sbin/nft dated Aug 2022) rejects the symbolic name for a
+		# nat/output chain in the inet family:
+		#   Error: invalid priority expression value in this context
+		# The unit then fails, no redirect table exists, and the node goes
+		# NotReady ~1 min later. Verified on ut3-ignition and cp-03.
+		type nat hook output priority -100; policy accept;
 		ip daddr ${SEED_IP} tcp dport ${FLUX_LOCAL_PORT} redirect to :${FLUX_LOCAL_PORT} comment "embernet-k3s-apiserver-via-flux"
 	}
 }
@@ -348,7 +354,36 @@ printf '  watchdog    : %s event(s)\n' "$(podman logs --tail 300 "$CONTAINER" 2>
 API_CODE="$(curl -sk -m 15 -o /dev/null -w '%{http_code}' "https://127.0.0.1:${FLUX_LOCAL_PORT}/version" 2>/dev/null || echo 000)"
 printf '  apiserver   : http_code=%s\n' "$API_CODE"
 
+# Two more conditions, both learned the hard way — the gate below used to be
+# API_CODE + HEALTH only, and printed "[+] OK" on two genuinely broken nodes:
+#
+#   cp-03: the old flux tunnel still owned :6443, so our proxy never bound.
+#          API_CODE was 401 because the OLD tunnel served the probe — the check
+#          went green while measuring the thing we were replacing.
+#   ut3-ignition: the redirect unit failed (nft priority), so nothing forced
+#          k3s through the proxy. Node reads Ready, then drops ~1 min later.
+#
+# Both must be asserted, not just displayed.
+PORT_OWNER="$(ss -lntp 2>/dev/null | grep ":${FLUX_LOCAL_PORT}" | grep -oE 'users:\(\("[^"]+' | cut -d'"' -f2 | head -1)"
+REDIRECT_OK=0
+nft list table inet embernet_k3s >/dev/null 2>&1 \
+  && [[ "$(systemctl is-active "$REDIRECT_UNIT" 2>/dev/null)" == "active" ]] && REDIRECT_OK=1
+
 echo
+if [[ "$PORT_OWNER" != "embernetlite" ]]; then
+  warn "NOT OK — :${FLUX_LOCAL_PORT} is owned by '${PORT_OWNER:-nothing}', not embernetlite."
+  warn "  The old tunnel still holds the port; our proxy never bound. Any apiserver"
+  warn "  probe above passed THROUGH THAT OLD TUNNEL and proves nothing."
+  warn "  Fix:  systemctl disable --now embernet-flux-edge-tunnel.service"
+  warn "  Leave embernet-flux-host alone — it binds kubelet/codesys/postgres."
+  exit 1
+fi
+if [[ "$REDIRECT_OK" -ne 1 ]]; then
+  warn "NOT OK — ${REDIRECT_UNIT} is not active or the nft table is missing."
+  warn "  k3s will dial ${SEED_IP} directly and go NotReady in about a minute."
+  warn "  Check:  journalctl -u ${REDIRECT_UNIT} -n 20 --no-pager"
+  exit 1
+fi
 if [[ "$API_CODE" =~ ^(200|401|403)$ ]] && [[ "$HEALTH" == *1.0.7* ]]; then
   log "OK — ${NODE} on 1.0.7, CP-02 apiserver reachable over Flux (HTTP ${API_CODE})."
   # The k3s node name is NOT the hostname. EN-0002 reports hostname
