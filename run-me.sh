@@ -54,7 +54,7 @@ warn() { printf '\n[!] %s\n' "$*" >&2; }
 fail() { printf '\n[x] %s\n' "$*" >&2; exit 1; }
 
 # =============================================================================
-# [1/7] PREFLIGHT — cheap checks that can fail the run go first
+# [1/8] PREFLIGHT — cheap checks that can fail the run go first
 # =============================================================================
 [[ "$EUID" -eq 0 ]] || fail "Run as root: sudo bash $0"
 for b in podman nft curl ss; do
@@ -62,7 +62,7 @@ for b in podman nft curl ss; do
 done
 
 NODE="$(hostname)"
-log "[1/7] node=${NODE}  image=${EMBERNET_IMAGE}  podman $(podman --version 2>/dev/null | awk '{print $3}')"
+log "[1/8] node=${NODE}  image=${EMBERNET_IMAGE}  podman $(podman --version 2>/dev/null | awk '{print $3}')"
 
 mkdir -p "$BK"
 cp -a "$IDENTITY_DIR" "$BK/identity-backup-$(date +%s)" 2>/dev/null || true
@@ -72,12 +72,12 @@ PREV_IMG="$(podman inspect "$CONTAINER" --format '{{.ImageName}}' 2>/dev/null ||
 log "current endpoint image: ${PREV_IMG}"
 
 # Pull BEFORE tearing anything down: a registry failure then changes nothing.
-log "[2/7] Pulling ${EMBERNET_IMAGE}..."
+log "[2/8] Pulling ${EMBERNET_IMAGE}..."
 podman pull "$EMBERNET_IMAGE" >/dev/null \
   || fail "Pull failed — check egress to ghcr.io. Nothing changed; safe to re-run."
 
 # =============================================================================
-# [3/7] IDENTITY
+# [3/8] IDENTITY
 #
 # Each node's own Trane-UT3-* identity was granted the 'trane-ut3' role
 # attribute centrally, which authorizes dialing trane-ut3-k3s-api. That alone
@@ -90,12 +90,12 @@ podman pull "$EMBERNET_IMAGE" >/dev/null \
 # =============================================================================
 SRC="$(ls "${FLUX_VOL}"/Embernode-UT3-*.json 2>/dev/null | head -1 || true)"
 if [[ -n "$SRC" ]]; then
-  log "[3/7] Identity handover: $(basename "$SRC") (preserves this node's service binds)"
+  log "[3/8] Identity handover: $(basename "$SRC") (preserves this node's service binds)"
   install -m 0600 "$SRC" "${IDENTITY_DIR}/$(basename "$SRC")"
   ln -sfn "$(basename "$SRC")" "${IDENTITY_DIR}/embernet.json"
   log "embernet.json -> $(readlink "${IDENTITY_DIR}/embernet.json")"
 else
-  log "[3/7] No Embernode identity in the flux volume — keeping the endpoint's own."
+  log "[3/8] No Embernode identity in the flux volume — keeping the endpoint's own."
   log "      Dial auth comes from the 'trane-ut3' role attribute; binds will not carry over."
 fi
 
@@ -107,7 +107,7 @@ mkdir -p /etc/embernet /var/lib/embernet /var/log/embernet /run/embernet
 chown -R 987:987 /var/lib/embernet /var/log/embernet /run/embernet 2>/dev/null || true
 
 # =============================================================================
-# [4/7] RETIRE THE OLD FLUX TUNNEL CONTAINER
+# [4/8] RETIRE THE OLD FLUX TUNNEL CONTAINER
 #
 # Two unit names exist in the field. Disabling only one leaves the container
 # running and holding :6443, so the endpoint cannot bind its proxy.
@@ -117,7 +117,7 @@ chown -R 987:987 /var/lib/embernet /var/log/embernet /run/embernet 2>/dev/null |
 # =============================================================================
 for u in embernet-flux-edge-tunnel.service container-embernet-flux-edge-tunnel.service; do
   if systemctl list-unit-files 2>/dev/null | grep -q "^${u}"; then
-    log "[4/7] Retiring ${u}"
+    log "[4/8] Retiring ${u}"
     cp "/etc/systemd/system/${u}" "$BK/" 2>/dev/null || true
     systemctl disable --now "$u" >/dev/null 2>&1 || true
   fi
@@ -132,7 +132,7 @@ fi
 log "Port ${FLUX_LOCAL_PORT} free."
 
 # =============================================================================
-# [5/7] RUN EMBERNETLITE IN PROXY MODE
+# [5/8] RUN EMBERNETLITE IN PROXY MODE
 #
 # Flags match deploy-ut3-en03.sh:110-115 plus CAP_NET_BIND_SERVICE and the
 # proxy env var.
@@ -145,7 +145,7 @@ log "Port ${FLUX_LOCAL_PORT} free."
 # EMBERNET_SAFETY_WATCHDOG_DISABLED=1 matches en03:112 — the watchdog pings the
 # pre-tunnel gateway and rolls back every tunnel if it never answers.
 # =============================================================================
-log "[5/7] Starting ${CONTAINER} (proxy ${FLUX_SERVICE}:${FLUX_LOCAL_PORT})..."
+log "[5/8] Starting ${CONTAINER} (proxy ${FLUX_SERVICE}:${FLUX_LOCAL_PORT})..."
 podman rm -f "$CONTAINER" systemd-embernet >/dev/null 2>&1 || true
 podman run -d \
   --name "$CONTAINER" \
@@ -168,14 +168,14 @@ podman run -d \
   || fail "podman run failed. Inspect: podman logs ${CONTAINER}"
 
 # =============================================================================
-# [6/7] SYSTEMD UNIT + WAIT FOR THE LISTENER
+# [6/8] SYSTEMD UNIT + WAIT FOR THE LISTENER
 #
 # `podman generate systemd`, NOT Quadlet: Ubuntu 22.04 ships podman 3.4.4 and
 # Quadlet needs >= 4.4 — it silently produces no unit and the failure reads
 # "Unit embernet.service not found".
 # =============================================================================
 sleep 5
-log "[6/7] Generating ${UNIT}..."
+log "[6/8] Generating ${UNIT}..."
 ( cd /etc/systemd/system && podman generate systemd \
     --name "$CONTAINER" --new --restart-policy=always \
     --container-prefix='' --separator='' > "$UNIT" ) \
@@ -194,7 +194,7 @@ ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE ":${FLUX_LOCAL_PORT}\$" \
 log "Listener up after ${w}s."
 
 # =============================================================================
-# [7/7] APISERVER REDIRECT, REBOOT-DURABLE
+# [7/8] APISERVER REDIRECT, REBOOT-DURABLE
 #
 # k3s agents auto-discover CP-02's ADVERTISED apiserver (${SEED_IP}:6443) and
 # switch their load balancer to dial it DIRECTLY, bypassing K3S_URL. Send it to
@@ -239,15 +239,83 @@ systemctl daemon-reload
 systemctl enable --now "$REDIRECT_UNIT" >/dev/null 2>&1 \
   || warn "${REDIRECT_UNIT} failed to start — k3s will dial ${SEED_IP} directly and go NotReady."
 if nft list table inet embernet_k3s >/dev/null 2>&1; then
-  log "[7/7] Apiserver redirect installed: ${SEED_IP}:${FLUX_LOCAL_PORT} -> local Flux proxy."
+  log "[7/8] Apiserver redirect installed: ${SEED_IP}:${FLUX_LOCAL_PORT} -> local Flux proxy."
 else
   warn "Redirect table missing. Check: nft list table inet embernet_k3s"
 fi
 
+# =============================================================================
+# [8/8] RESTART k3s AND RECOVER FLANNEL — MANDATORY, AND AFTER THE ENDPOINT
+#
+# flannel binds --flannel-iface=embernet0, and embernetlite OWNS that
+# interface. Replacing the endpoint container bounces embernet0; flannel sees
+# its interface disappear, logs "Interface flannel.1 deleted", then retries
+# "external interface  not found" forever. It does NOT self-recover.
+#
+# That is exactly what happened on CP-02 at 09:41 on 2026-07-21: the cluster
+# lost cross-node pod networking until k3s was restarted, which is why
+# cattle-cluster-agent could not resolve DNS. Skipping this leaves the node in
+# that state, and the damage is cluster-wide, not node-local.
+# =============================================================================
 K3SU="$(systemctl list-unit-files 2>/dev/null | grep -oE '^k3s-[a-z-]+\.service' | head -1 || true)"
-if [[ -n "$K3SU" ]]; then
-  log "Restarting ${K3SU} so the agent picks up the new path..."
-  systemctl restart "$K3SU" || warn "${K3SU} restart failed. Inspect: journalctl -xeu ${K3SU} -n 60"
+if [[ -z "$K3SU" ]]; then
+  warn "No k3s unit found — skipping the k3s restart. If this node runs k3s, restart it manually."
+else
+  # Boot-ordering guard so a reboot cannot recreate this. Fixes boot only; the
+  # restart below is what fixes the here-and-now.
+  DROPIN="/etc/systemd/system/${K3SU}.d"
+  mkdir -p "$DROPIN"
+  cat > "${DROPIN}/10-wait-embernet0.conf" <<DROP
+[Unit]
+# Ordering: k3s must not start before embernetlite has created embernet0,
+# or flannel finds no interface and never creates flannel.1.
+#
+# ${REDIRECT_UNIT} is listed for a second reason. It also carries
+# PartOf=${UNIT}, so an endpoint restart bounces BOTH it and k3s. Without
+# ordering, k3s can come back while the nft table is still torn down, dial
+# ${SEED_IP}:${FLUX_LOCAL_PORT} directly, and go NotReady ~1 min later — the
+# exact failure step [7/8] exists to prevent.
+After=${UNIT} ${REDIRECT_UNIT}
+Wants=${UNIT} ${REDIRECT_UNIT}
+
+# PartOf: propagate stop/restart. This is the half that matters at runtime —
+# ANY restart of the endpoint (upgrade, crash, podman restart) bounces
+# embernet0, and flannel does not re-bind on its own. Without this, an
+# endpoint upgrade silently kills cross-node pod networking cluster-wide,
+# exactly as happened on CP-02 at 09:41 on 2026-07-21.
+PartOf=${UNIT}
+
+[Service]
+# Belt and braces: even with correct ordering, embernet0 can lag the
+# container becoming "started". Wait for the interface, not the unit.
+ExecStartPre=/bin/sh -c 'for i in \$(seq 1 60); do ip link show embernet0 >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
+DROP
+  systemctl daemon-reload
+  log "[8/8] Permanence installed: ${K3SU} waits for embernet0 at boot AND"
+  log "      restarts whenever ${UNIT} restarts (PartOf=)."
+
+  ip link show embernet0 >/dev/null 2>&1 \
+    || warn "embernet0 absent — flannel cannot bind. Check: podman logs ${CONTAINER}"
+
+  log "Restarting ${K3SU} so flannel rebinds embernet0..."
+  # A Type=notify readiness timeout reports failure while the process comes up
+  # fine. Do NOT trust the exit code — verify by state below.
+  systemctl restart "$K3SU" \
+    || warn "systemctl reported failure (usually a Type=notify readiness timeout) — verifying by state instead."
+
+  log "Waiting for flannel.1 (cross-node pod network)..."
+  fw=0
+  while (( fw < 120 )); do
+    ip link show flannel.1 >/dev/null 2>&1 && break
+    sleep 5; fw=$((fw+5))
+  done
+  if ip link show flannel.1 >/dev/null 2>&1; then
+    log "flannel.1 up after ${fw}s: $(ip -brief -4 addr show flannel.1 2>/dev/null | awk '{print $3}')"
+  else
+    warn "flannel.1 DID NOT appear after ${fw}s — cross-node pod traffic will NOT work."
+    warn "Check:  journalctl -u ${K3SU} --no-pager | grep -i 'external interface' | tail -3"
+    warn "\"external interface  not found\" (double space) means embernet0 was missing when flannel started."
+  fi
 fi
 
 # =============================================================================
@@ -275,7 +343,13 @@ printf '  apiserver   : http_code=%s\n' "$API_CODE"
 echo
 if [[ "$API_CODE" =~ ^(200|401|403)$ ]] && [[ "$HEALTH" == *1.0.7* ]]; then
   log "OK — ${NODE} on 1.0.7, CP-02 apiserver reachable over Flux (HTTP ${API_CODE})."
-  printf '\n  Confirm the join from CP-02:\n      k3s kubectl get node %s -o wide\n\n' "$NODE"
+  # The k3s node name is NOT the hostname. EN-0002 reports hostname
+  # "universaltester001" but is "trane-ut3-en-0002" in the cluster, so using
+  # $NODE here printed an unusable command. Read it from kube-proxy's
+  # --hostname-override, which is authoritative.
+  K3SNODE="$(journalctl -u "${K3SU:-k3s}" --no-pager 2>/dev/null \
+    | grep -oE '\-\-hostname-override=[a-z0-9.-]+' | tail -1 | cut -d= -f2)"
+  printf '\n  Confirm the join from CP-02:\n      k3s kubectl get node %s -o wide\n\n' "${K3SNODE:-$NODE}"
 elif [[ "$API_CODE" =~ ^(200|401|403)$ ]]; then
   warn "Apiserver reachable but health did not report 1.0.7. Inspect: podman logs --tail 50 ${CONTAINER}"
 else
