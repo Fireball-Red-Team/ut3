@@ -123,6 +123,14 @@ for u in embernet-flux-edge-tunnel.service container-embernet-flux-edge-tunnel.s
   fi
 done
 podman rm -f embernet-flux-edge-tunnel >/dev/null 2>&1 || true
+
+# Drop OUR OWN endpoint before the port check below, not in step [5/8].
+# On a re-run the endpoint is already up and holding ${FLUX_LOCAL_PORT} in
+# proxy mode, and the check cannot tell that from the old flux tunnel holding
+# it — so the script aborted with "Port still held" on exactly the nodes where
+# it had previously succeeded. The check is meant to catch a FOREIGN holder;
+# ours is about to be replaced by step [5/8] regardless.
+podman rm -f "$CONTAINER" systemd-embernet >/dev/null 2>&1 || true
 systemctl daemon-reload
 
 if ss -lnt 2>/dev/null | awk '{print $4}' | grep -qE ":${FLUX_LOCAL_PORT}\$"; then
